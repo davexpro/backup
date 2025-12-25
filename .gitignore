@@ -1,0 +1,11 @@
+.idea/
+*.pyc
+.DS*
+*swp
+.vscode/
+/output/
+/log/
+*.log
+.coverage
+
+main

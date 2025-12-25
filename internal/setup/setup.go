@@ -1,4 +1,4 @@
-package backup
+package setup
 
 import (
 	"fmt"
@@ -8,12 +8,8 @@ import (
 	"strings"
 )
 
-// CheckAndInstallMySQLShell checks if mysqlsh is installed and installs it on Debian if missing.
-func CheckAndInstallMySQLShell() error {
-	// 1. OS Check (Debian only)
-	if !isDebian() {
-		return fmt.Errorf("the setup command is only supported on Debian-based systems")
-	}
+// checkAndInstallMySQLShell checks if mysqlsh is installed and installs it on Debian if missing.
+func checkAndInstallMySQLShell() error {
 
 	// 2. Check if mysqlsh is already installed
 	if _, err := exec.LookPath("mysqlsh"); err == nil {

@@ -1,0 +1,137 @@
+name: Golang CI & Release
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # 关键：允许创建 Release 与上传 assets（tag 触发时用到）
+  actions: read
+
+jobs:
+  ci:
+    name: CI (test & build)
+    runs-on: ubuntu-latest
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }} # 非 tag 才跑 CI
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Go test
+        run: go test ./... -v
+
+      - name: Go build
+        run: |
+          mkdir -p output
+          go build -trimpath -o output/backup ./cmd/backup
+
+      # 可选：把 CI 编译产物作为 Actions artifact 保存（不是 Release）
+      - name: Upload CI artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-build-linux-amd64
+          path: output/app
+
+  release:
+    name: Release (build & upload assets)
+    runs-on: ubuntu-latest
+    if: ${{ startsWith(github.ref, 'refs/tags/') }} # 只有 tag 才跑
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+
+          TAG="${GITHUB_REF_NAME}"
+          BIN_NAME="backup"
+
+          # 你要注入的信息
+          GIT_SHA="${GITHUB_SHA}"                       # 完整 SHA
+          # 如想短 SHA：GIT_SHA="${GITHUB_SHA::7}"
+          DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"       # UTC 时间
+
+          mkdir -p dist
+
+          EXT=""
+          if [ "${GOOS}" = "windows" ]; then
+            EXT=".exe"
+          fi
+
+          # 基础 ldflags（跨平台都可用）
+          LDFLAGS="-s -w -X main.magic=${GIT_SHA} -X main.date=${DATE}"
+
+          # Linux 才加 -static（并安装 musl 工具链以提高成功率）
+          if [ "${GOOS}" = "linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y musl-tools
+
+            export CGO_ENABLED=1
+            export CC=musl-gcc
+
+            # 注意这里的引号：需要把 "-static" 作为 extldflags 的参数
+            LDFLAGS="${LDFLAGS} -extldflags \"-static\""
+          else
+            export CGO_ENABLED=0
+          fi
+
+          go build -trimpath \
+            -ldflags "${LDFLAGS}" \
+            -o "dist/${BIN_NAME}-${GOOS}-${GOARCH}${EXT}" \
+            ./cmd/backup
+
+          # ====== 下面按你现有逻辑打包即可（示例保留） ======
+          ASSET_BASE="${BIN_NAME}-${TAG}-${GOOS}-${GOARCH}"
+          if [ "${GOOS}" = "windows" ]; then
+            zip -j "dist/${ASSET_BASE}.zip" "dist/${BIN_NAME}-${GOOS}-${GOARCH}${EXT}" README* LICENSE* 2>/dev/null || \
+              zip -j "dist/${ASSET_BASE}.zip" "dist/${BIN_NAME}-${GOOS}-${GOARCH}${EXT}"
+            echo "ASSET_PATH=dist/${ASSET_BASE}.zip" >> $GITHUB_ENV
+          else
+            tar -czf "dist/${ASSET_BASE}.tar.gz" -C dist "${BIN_NAME}-${GOOS}-${GOARCH}${EXT}" \
+              $(ls README* LICENSE* 2>/dev/null || true)
+            echo "ASSET_PATH=dist/${ASSET_BASE}.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - name: Create GitHub Release and upload asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET_PATH }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

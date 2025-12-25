@@ -5,19 +5,37 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
+	"time"
+
+	"github.com/urfave/cli/v2"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
 
 	"github.com/davexpro/backup/internal/backup"
 	"github.com/davexpro/backup/internal/config"
 	model "github.com/davexpro/backup/internal/db"
 	"github.com/davexpro/backup/internal/notify"
+	"github.com/davexpro/backup/internal/setup"
 	"github.com/davexpro/backup/internal/storage"
 	"github.com/davexpro/backup/internal/utils"
-	"github.com/urfave/cli/v2"
-	"gorm.io/driver/mysql"
-	"gorm.io/gorm"
 )
 
+var (
+	date      = "not provided (use build.sh instead of 'go build')"
+	magic     = "not provided (use build.sh instead of 'go build')"
+	startTime = time.Now()
+)
+
+func printVersion() {
+	fmt.Printf("%10s : %s\n", "built", runtime.Version())
+	fmt.Printf("%10s : %s\n", "date", date)
+	fmt.Printf("%10s : %s\n", "magic", magic)
+}
+
 func main() {
+	printVersion()
+	
 	app := &cli.App{
 		Name:  "backup",
 		Usage: "MySQL backup tool with separate compression, SHA256, MinIO upload, retention policy and history logging",
@@ -34,13 +52,7 @@ func main() {
 			},
 		},
 		Commands: []*cli.Command{
-			{
-				Name:  "setup",
-				Usage: "Install dependencies (mysqlsh) on Debian-based systems",
-				Action: func(c *cli.Context) error {
-					return backup.CheckAndInstallMySQLShell()
-				},
-			},
+			setup.Command,
 			{
 				Name:  "mysql",
 				Usage: "Run MySQL backup workflow",
