@@ -6,6 +6,10 @@ mysql:
   exclude:
     - "test_db"
 
+backup:
+  temp_dir: "/path/to/temp"      # Default: system temp dir
+  delete_after_upload: true      # Default: true (delete temp files)
+
 r2:
   endpoint: "https://<account_id>.r2.cloudflarestorage.com"
   access_key: "your_access_key"

@@ -53,8 +53,8 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
-          - goos: linux
-            goarch: arm64
+#          - goos: linux
+#            goarch: arm64
           - goos: darwin
             goarch: amd64
           - goos: darwin
@@ -110,7 +110,8 @@ jobs:
           else
             export CGO_ENABLED=0
           fi
-
+          
+          export CGO_ENABLED=0
           go build -trimpath \
             -ldflags "${LDFLAGS}" \
             -o "output/${BIN_NAME}-${GOOS}-${GOARCH}${EXT}" \

@@ -27,6 +27,7 @@ func checkAndInstallMySQLShell() error {
 
 	installCmds := [][]string{
 		{"apt-get", "update"},
+		{"apt-get", "install", "-y", "libssh-4 libyaml-0-2 zip unzip"},
 		{"apt-get", "install", "-y", "mysql-shell"},
 	}
 

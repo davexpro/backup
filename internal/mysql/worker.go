@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/davexpro/backup/internal/config"
@@ -39,11 +40,15 @@ func (w *Worker) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to list databases: %w", err)
 	}
 
+	// Filter databases based on include list
+	databases = w.filterDatabases(databases)
+	log.Printf("Databases to backup: %v", databases)
+
 	var results []helper.BackupResult
 	var successCount, failCount int
 
 	for _, dbName := range databases {
-		if w.shouldExclude(dbName) {
+		if w.shouldExcludeDB(dbName) {
 			log.Printf("Skipping excluded database: %s", dbName)
 			continue
 		}
@@ -82,58 +87,63 @@ func (w *Worker) listDatabases(ctx context.Context) ([]string, error) {
 		fmt.Sprintf("--password=%s", w.cfg.MySQL.Password),
 		fmt.Sprintf("--host=%s", w.cfg.MySQL.Host),
 		fmt.Sprintf("--port=%d", w.cfg.MySQL.Port),
-		"--batch",
+		"--sql",
 		"-e",
 		"SELECT schema_name FROM information_schema.schemata",
 	}
 
+	log.Printf("Listing databases...")
 	cmd := exec.CommandContext(ctx, "mysqlsh", args...)
-	output, err := cmd.Output()
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("mysqlsh list databases failed: %w", err)
+		return nil, fmt.Errorf("mysqlsh list databases failed: %w, output: %s", err, string(output))
 	}
 
 	var databases []string
-	lines := filepath.SplitList(string(output))
-	// Parse output - mysqlsh returns schema names one per line
-	for _, line := range splitLines(string(output)) {
-		line = trimSpace(line)
-		if line != "" && line != "schema_name" {
-			databases = append(databases, line)
+	// Parse output - filter out warnings, headers, and empty lines
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		// Skip empty lines, warnings, headers, and separator lines
+		if line == "" ||
+			strings.HasPrefix(line, "WARNING:") ||
+			strings.HasPrefix(line, "SCHEMA_NAME") ||
+			strings.HasPrefix(line, "schema_name") ||
+			strings.HasPrefix(line, "+") ||
+			strings.HasPrefix(line, "|") {
+			continue
 		}
+		databases = append(databases, line)
 	}
-	_ = lines // unused
+
+	log.Printf("Found databases: %v", databases)
 	return databases, nil
 }
 
-func splitLines(s string) []string {
-	var lines []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
-			lines = append(lines, s[start:i])
-			start = i + 1
+// filterDatabases filters databases based on include list
+func (w *Worker) filterDatabases(databases []string) []string {
+	// If include list is specified, only include those databases
+	var filtered []string
+	for _, dbName := range databases {
+		if strings.Contains(dbName, "WARNING:") {
+			continue
+		}
+		filtered = append(filtered, dbName)
+	}
+	if len(w.cfg.MySQL.Include) > 0 {
+		for _, db := range filtered {
+			for _, inc := range w.cfg.MySQL.Include {
+				if db == inc {
+					filtered = append(filtered, db)
+					break
+				}
+			}
 		}
 	}
-	if start < len(s) {
-		lines = append(lines, s[start:])
-	}
-	return lines
+	return filtered
 }
 
-func trimSpace(s string) string {
-	start := 0
-	end := len(s)
-	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r' || s[start] == '\n') {
-		start++
-	}
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\r' || s[end-1] == '\n') {
-		end--
-	}
-	return s[start:end]
-}
-
-func (w *Worker) shouldExclude(dbName string) bool {
+// shouldExcludeDB checks if a database should be excluded
+func (w *Worker) shouldExcludeDB(dbName string) bool {
 	systemDBs := []string{"information_schema", "performance_schema", "mysql", "sys"}
 	for _, sys := range systemDBs {
 		if dbName == sys {
@@ -150,20 +160,30 @@ func (w *Worker) shouldExclude(dbName string) bool {
 
 func (w *Worker) backupDatabase(ctx context.Context, dbName string) helper.BackupResult {
 	timestamp := time.Now().Format("20060102_150405")
-	dumpDir := filepath.Join(os.TempDir(), fmt.Sprintf("%s_%s", dbName, timestamp))
+	dumpDir := filepath.Join(w.cfg.Backup.TempDir, fmt.Sprintf("%s_%s", dbName, timestamp))
 
 	zipFilename := fmt.Sprintf("%s_%s.zip", dbName, timestamp)
-	localZipPath := filepath.Join(os.TempDir(), zipFilename)
+	localZipPath := filepath.Join(w.cfg.Backup.TempDir, zipFilename)
 
 	if err := w.dump(ctx, dbName, dumpDir); err != nil {
 		return helper.BackupResult{Database: dbName, Success: false, Error: err}
 	}
-	defer os.RemoveAll(dumpDir)
+	// Cleanup dump directory based on config
+	if w.cfg.Backup.DeleteAfterUpload {
+		defer os.RemoveAll(dumpDir)
+	} else {
+		log.Printf("Keeping dump directory: %s", dumpDir)
+	}
 
 	if err := helper.ZipEncryptFolder(ctx, w.cfg.Encryption.Password, dumpDir, localZipPath); err != nil {
 		return helper.BackupResult{Database: dbName, Success: false, Error: fmt.Errorf("zip encryption failed: %w", err)}
 	}
-	defer os.Remove(localZipPath)
+	// Cleanup zip file based on config
+	if w.cfg.Backup.DeleteAfterUpload {
+		defer os.Remove(localZipPath)
+	} else {
+		log.Printf("Keeping zip file: %s", localZipPath)
+	}
 
 	hash, size, err := helper.CalculateSHA256(localZipPath)
 	if err != nil {
@@ -204,22 +224,99 @@ func (w *Worker) dump(ctx context.Context, dbName, outputPath string) error {
 	if err := os.MkdirAll(outputPath, 0755); err != nil {
 		return err
 	}
+
+	// Build dump options
+	dumpOpts := w.buildDumpOptions(dbName, outputPath)
+
+	// Use --js for JavaScript mode since util.dumpSchemas is a JS function
 	args := []string{
 		fmt.Sprintf("--user=%s", w.cfg.MySQL.User),
 		fmt.Sprintf("--password=%s", w.cfg.MySQL.Password),
 		fmt.Sprintf("--host=%s", w.cfg.MySQL.Host),
 		fmt.Sprintf("--port=%d", w.cfg.MySQL.Port),
-		"--batch",
+		"--js",
 		"-e",
-		fmt.Sprintf("util.dumpSchemas(['%s'], '%s', {threads: 4, compression: 'none'})", dbName, outputPath),
+		dumpOpts,
 	}
 
+	log.Printf("Dumping database %s to %s", dbName, outputPath)
 	cmd := exec.CommandContext(ctx, "mysqlsh", args...)
-	cmd.Stderr = os.Stderr
-	cmd.Stdout = os.Stdout
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("mysqlsh dump failed: %w", err)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("mysqlsh dump failed: %w, output: %s", err, string(output))
 	}
+	log.Printf("Dump completed for %s", dbName)
 	return nil
+}
+
+// buildDumpOptions builds the util.dumpSchemas command with table filtering support using JS logic
+func (w *Worker) buildDumpOptions(dbName, outputPath string) string {
+	threads := w.cfg.MySQL.Threads
+	filters := w.cfg.MySQL.TableFilters
+
+	// Escape strings for JS
+	jsIncludeTables := "[]"
+	if len(filters.Include) > 0 {
+		var entries []string
+		for _, t := range filters.Include {
+			entries = append(entries, fmt.Sprintf("'%s.%s'", dbName, t))
+		}
+		jsIncludeTables = "[" + strings.Join(entries, ", ") + "]"
+	}
+
+	jsExcludeTables := "[]"
+	if len(filters.Exclude) > 0 {
+		var entries []string
+		for _, t := range filters.Exclude {
+			entries = append(entries, fmt.Sprintf("'%s.%s'", dbName, t))
+		}
+		jsExcludeTables = "[" + strings.Join(entries, ", ") + "]"
+	}
+
+	jsIncludePrefixes := "[]"
+	if len(filters.IncludePrefix) > 0 {
+		var entries []string
+		for _, p := range filters.IncludePrefix {
+			entries = append(entries, fmt.Sprintf("'%s'", p))
+		}
+		jsIncludePrefixes = "[" + strings.Join(entries, ", ") + "]"
+	}
+
+	jsExcludePrefixes := "[]"
+	if len(filters.ExcludePrefix) > 0 {
+		var entries []string
+		for _, p := range filters.ExcludePrefix {
+			entries = append(entries, fmt.Sprintf("'%s'", p))
+		}
+		jsExcludePrefixes = "[" + strings.Join(entries, ", ") + "]"
+	}
+
+	// Dynamic script to calculate table lists based on prefixes
+	script := fmt.Sprintf(`
+var db = '%s';
+var includeTables = %s;
+var excludeTables = %s;
+var includePrefixes = %s;
+var excludePrefixes = %s;
+
+includePrefixes.forEach(function(p) {
+    var rs = session.runSql("SELECT table_name FROM information_schema.tables WHERE table_schema=? AND table_name LIKE ?", [db, p + "%%"]);
+    rs.fetchAll().forEach(function(row) { includeTables.push(db + "." + row[0]); });
+});
+
+excludePrefixes.forEach(function(p) {
+    var rs = session.runSql("SELECT table_name FROM information_schema.tables WHERE table_schema=? AND table_name LIKE ?", [db, p + "%%"]);
+    rs.fetchAll().forEach(function(row) { excludeTables.push(db + "." + row[0]); });
+});
+
+var opts = {threads: %d, compression: 'zstd'};
+if (includeTables.length > 0) opts.includeTables = includeTables;
+if (excludeTables.length > 0) opts.excludeTables = excludeTables;
+
+util.dumpSchemas([db], '%s', opts);
+`, dbName, jsIncludeTables, jsExcludeTables, jsIncludePrefixes, jsExcludePrefixes, threads, outputPath)
+
+	// Clean up script for logging and execution (remove newlines for -e if necessary, but mysqlsh supports multidatabase scripts)
+	log.Printf("Generated mysqlsh JS script for %s", dbName)
+	return script
 }

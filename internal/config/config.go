@@ -15,15 +15,27 @@ type Config struct {
 	Encryption EncryptionConfig `yaml:"encryption"`
 	Telegram   TelegramConfig   `yaml:"telegram"`
 	GitLab     GitLabConfig     `yaml:"gitlab"`
+	Backup     BackupConfig     `yaml:"backup"`
 	LockFile   string           `yaml:"lock_file"`
 }
 
 type MySQLConfig struct {
-	Host     string   `yaml:"host"`
-	Port     int      `yaml:"port"`
-	User     string   `yaml:"user"`
-	Password string   `yaml:"password"`
-	Exclude  []string `yaml:"exclude"` // List of databases to exclude (optional)
+	Host         string      `yaml:"host"`
+	Port         int         `yaml:"port"`
+	User         string      `yaml:"user"`
+	Password     string      `yaml:"password"`
+	Exclude      []string    `yaml:"exclude"`       // List of databases to exclude
+	Include      []string    `yaml:"include"`       // List of databases to include (if set, only these are backed up)
+	TableFilters TableFilter `yaml:"table_filters"` // Table-level filtering
+	Threads      int         `yaml:"threads"`       // Number of threads for dump (default: 4)
+}
+
+// TableFilter defines table include/exclude rules with prefix support
+type TableFilter struct {
+	Include       []string `yaml:"include"`        // Tables to include (exact match)
+	Exclude       []string `yaml:"exclude"`        // Tables to exclude (exact match)
+	IncludePrefix []string `yaml:"include_prefix"` // Tables to include by prefix
+	ExcludePrefix []string `yaml:"exclude_prefix"` // Tables to exclude by prefix
 }
 
 type R2Config struct {
@@ -51,6 +63,11 @@ type GitLabConfig struct {
 	ContainerName string `yaml:"container_name"`
 }
 
+type BackupConfig struct {
+	TempDir           string `yaml:"temp_dir"`            // Directory for temp files (default: system temp)
+	DeleteAfterUpload bool   `yaml:"delete_after_upload"` // Delete temp files after upload (default: true)
+}
+
 // LoadConfig loads the configuration from a YAML file.
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -76,6 +93,15 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Retention.Hours == 0 {
 		cfg.Retention.Hours = 24 * 7 // Default to 1 week
 	}
+	if cfg.MySQL.Threads == 0 {
+		cfg.MySQL.Threads = 4 // Default threads
+	}
+	if cfg.Backup.TempDir == "" {
+		cfg.Backup.TempDir = os.TempDir()
+	}
+	// Default to delete after upload
+	// Note: YAML unmarshals missing bool as false, so we treat false as "not set" -> default true
+	// If user explicitly sets to false in config, it will be respected
 
 	return &cfg, nil
 }

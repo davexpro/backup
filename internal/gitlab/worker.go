@@ -49,55 +49,69 @@ func (w *Worker) Run(ctx context.Context) error {
 func (w *Worker) backup(ctx context.Context) helper.BackupResult {
 	start := time.Now()
 	timestamp := start.Format("20060102_150405")
-	tempDir := filepath.Join(os.TempDir(), fmt.Sprintf("gitlab_backup_%s", timestamp))
+	tempDir := filepath.Join(w.cfg.Backup.TempDir, fmt.Sprintf("gitlab_backup_%s", timestamp))
 	if err := os.MkdirAll(tempDir, 0755); err != nil {
 		return helper.BackupResult{Database: "gitlab", Success: false, Error: fmt.Errorf("failed to create temp dir: %w", err)}
 	}
-	defer os.RemoveAll(tempDir)
+	// Cleanup based on config
+	if w.cfg.Backup.DeleteAfterUpload {
+		defer os.RemoveAll(tempDir)
+	} else {
+		log.Printf("Keeping temp directory: %s", tempDir)
+	}
 
 	// 1. Trigger GitLab Backup via Rake
 	log.Println("Triggering GitLab rake backup...")
 	cmd := exec.CommandContext(ctx, "docker", "exec", w.cfg.GitLab.ContainerName, "gitlab-rake", "gitlab:backup:create")
-	if output, err := cmd.CombinedOutput(); err != nil {
+	output, err := cmd.CombinedOutput()
+	if err != nil {
 		return helper.BackupResult{Database: "gitlab", Success: false, Error: fmt.Errorf("gitlab-rake failed: %w, output: %s", err, string(output))}
 	}
+	log.Printf("GitLab rake backup completed")
 
 	// 2. Identify the backup file
 	findCmd := exec.CommandContext(ctx, "docker", "exec", w.cfg.GitLab.ContainerName, "bash", "-c", "ls -t /var/opt/gitlab/backups/*_gitlab_backup.tar | head -1")
-	output, err := findCmd.Output()
+	findOutput, err := findCmd.CombinedOutput()
 	if err != nil {
-		return helper.BackupResult{Database: "gitlab", Success: false, Error: fmt.Errorf("failed to find backup file in container: %w", err)}
+		return helper.BackupResult{Database: "gitlab", Success: false, Error: fmt.Errorf("failed to find backup file in container: %w, output: %s", err, string(findOutput))}
 	}
-	remoteBackupPath := filepath.Clean(strings.TrimSpace(string(output)))
+	remoteBackupPath := filepath.Clean(strings.TrimSpace(string(findOutput)))
 	if remoteBackupPath == "" {
 		return helper.BackupResult{Database: "gitlab", Success: false, Error: fmt.Errorf("no backup file found in container")}
 	}
 	backupFilename := filepath.Base(remoteBackupPath)
+	log.Printf("Found backup file: %s", backupFilename)
 
 	// 3. Copy files from container to host
 	log.Printf("Copying backup file %s to host...", backupFilename)
 	cpCmd := exec.CommandContext(ctx, "docker", "cp", fmt.Sprintf("%s:%s", w.cfg.GitLab.ContainerName, remoteBackupPath), tempDir)
-	if err := cpCmd.Run(); err != nil {
-		return helper.BackupResult{Database: "gitlab", Success: false, Error: fmt.Errorf("failed to copy backup file: %w", err)}
+	cpOutput, err := cpCmd.CombinedOutput()
+	if err != nil {
+		return helper.BackupResult{Database: "gitlab", Success: false, Error: fmt.Errorf("failed to copy backup file: %w, output: %s", err, string(cpOutput))}
 	}
 
 	log.Println("Copying GitLab configuration and secrets...")
 	configFiles := []string{"/etc/gitlab/gitlab.rb", "/etc/gitlab/gitlab-secrets.json"}
 	for _, f := range configFiles {
 		cpFileCmd := exec.CommandContext(ctx, "docker", "cp", fmt.Sprintf("%s:%s", w.cfg.GitLab.ContainerName, f), tempDir)
-		if err := cpFileCmd.Run(); err != nil {
-			log.Printf("Warning: failed to copy %s: %v", f, err)
+		if cpErr := cpFileCmd.Run(); cpErr != nil {
+			log.Printf("Warning: failed to copy %s: %v", f, cpErr)
 		}
 	}
 
 	// 4. Zip & Encrypt all fetched files
 	zipFilename := fmt.Sprintf("gitlab_backup_%s.zip", timestamp)
-	localZipPath := filepath.Join(os.TempDir(), zipFilename)
+	localZipPath := filepath.Join(w.cfg.Backup.TempDir, zipFilename)
 
 	if err := helper.ZipEncryptFolder(ctx, w.cfg.Encryption.Password, tempDir, localZipPath); err != nil {
 		return helper.BackupResult{Database: "gitlab", Success: false, Error: fmt.Errorf("zip encryption failed: %w", err)}
 	}
-	defer os.Remove(localZipPath)
+	// Cleanup zip based on config
+	if w.cfg.Backup.DeleteAfterUpload {
+		defer os.Remove(localZipPath)
+	} else {
+		log.Printf("Keeping zip file: %s", localZipPath)
+	}
 
 	// 5. Calculate SHA256
 	hash, size, err := helper.CalculateSHA256(localZipPath)
