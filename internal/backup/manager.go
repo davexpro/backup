@@ -16,6 +16,7 @@ import (
 	model "github.com/davexpro/backup/internal/db"
 	"github.com/davexpro/backup/internal/notify"
 	"github.com/davexpro/backup/internal/storage"
+	"github.com/davexpro/backup/internal/utils"
 	"gorm.io/gorm"
 )
 
@@ -24,6 +25,7 @@ type Manager struct {
 	storage  *storage.Storage
 	notifier *notify.TelegramSender
 	db       *gorm.DB
+	OnlyDump bool
 }
 
 func NewManager(cfg *config.Config, store *storage.Storage, notifier *notify.TelegramSender, db *gorm.DB) *Manager {
@@ -32,6 +34,7 @@ func NewManager(cfg *config.Config, store *storage.Storage, notifier *notify.Tel
 		storage:  store,
 		notifier: notifier,
 		db:       db,
+		OnlyDump: false,
 	}
 }
 
@@ -153,11 +156,11 @@ func (m *Manager) backupDatabase(ctx context.Context, dbName string) BackupResul
 	zipFilename := fmt.Sprintf("%s_%s.zip", dbName, timestamp)
 	localZipPath := filepath.Join(os.TempDir(), zipFilename)
 
-	// 1. Dump to SQL
+	// 1. Dump to SQL using mysqlsh
 	if err := m.dump(ctx, dbName, localSQLPath); err != nil {
 		return BackupResult{Database: dbName, Success: false, Error: err}
 	}
-	defer os.Remove(localSQLPath) // Clean up temp SQL file
+	defer os.RemoveAll(localSQLPath) // mysqlsh dumps to a directory
 
 	// 2. Zip & Encrypt
 	if err := m.zipEncrypt(ctx, localSQLPath, localZipPath); err != nil {
@@ -171,15 +174,27 @@ func (m *Manager) backupDatabase(ctx context.Context, dbName string) BackupResul
 		return BackupResult{Database: dbName, Success: false, Error: fmt.Errorf("hash calc failed: %w", err)}
 	}
 
-	// 4. Upload
-	file, err := os.Open(localZipPath)
-	if err != nil {
-		return BackupResult{Database: dbName, Success: false, Error: fmt.Errorf("open file failed: %w", err)}
-	}
-	defer file.Close()
+	// 4. Handle Upload or Local Save
+	if m.OnlyDump {
+		localDir := "local_backups"
+		if err := os.MkdirAll(localDir, 0755); err != nil {
+			return BackupResult{Database: dbName, Success: false, Error: fmt.Errorf("failed to create local backup dir: %w", err)}
+		}
+		finalPath := filepath.Join(localDir, zipFilename)
+		if err := utils.CopyFile(localZipPath, finalPath); err != nil {
+			return BackupResult{Database: dbName, Success: false, Error: fmt.Errorf("failed to save local backup: %w", err)}
+		}
+		log.Printf("Saved backup locally to %s", finalPath)
+	} else {
+		file, err := os.Open(localZipPath)
+		if err != nil {
+			return BackupResult{Database: dbName, Success: false, Error: fmt.Errorf("open file failed: %w", err)}
+		}
+		defer file.Close()
 
-	if err := m.storage.Upload(ctx, zipFilename, file); err != nil {
-		return BackupResult{Database: dbName, Success: false, Error: fmt.Errorf("upload failed: %w", err)}
+		if err := m.storage.Upload(ctx, zipFilename, file); err != nil {
+			return BackupResult{Database: dbName, Success: false, Error: fmt.Errorf("upload failed: %w", err)}
+		}
 	}
 
 	return BackupResult{
@@ -191,29 +206,31 @@ func (m *Manager) backupDatabase(ctx context.Context, dbName string) BackupResul
 }
 
 func (m *Manager) dump(ctx context.Context, dbName, outputPath string) error {
-	outFile, err := os.Create(outputPath)
-	if err != nil {
+	// mysqlsh uses a directory for dumping
+	if err := os.MkdirAll(outputPath, 0755); err != nil {
 		return err
 	}
-	defer outFile.Close()
 
+	// mysqlsh -u <user> -p<pass> -h <host> -P <port> -- util dump-schemas <schema> <path> --threads=4
+	// Using --util dump-schemas instead of dump-instance for specific database
 	args := []string{
-		"-h", m.cfg.MySQL.Host,
-		fmt.Sprintf("-P%d", m.cfg.MySQL.Port),
-		"-u", m.cfg.MySQL.User,
-		"--single-transaction",
-		"--quick",
-		"--routines",
-		"--triggers",
-		dbName,
+		fmt.Sprintf("--user=%s", m.cfg.MySQL.User),
+		fmt.Sprintf("--password=%s", m.cfg.MySQL.Password),
+		fmt.Sprintf("--host=%s", m.cfg.MySQL.Host),
+		fmt.Sprintf("--port=%d", m.cfg.MySQL.Port),
+		"--batch",
+		"-e",
+		fmt.Sprintf("util.dumpSchemas(['%s'], '%s', {threads: 4, compression: 'none'})", dbName, outputPath),
 	}
 
-	cmd := exec.CommandContext(ctx, "mysqldump", args...)
-	cmd.Env = append(os.Environ(), fmt.Sprintf("MYSQL_PWD=%s", m.cfg.MySQL.Password))
-	cmd.Stdout = outFile
+	cmd := exec.CommandContext(ctx, "mysqlsh", args...)
 	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
 
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("mysqlsh dump failed: %w", err)
+	}
+	return nil
 }
 
 func (m *Manager) zipEncrypt(ctx context.Context, srcPath, dstPath string) error {

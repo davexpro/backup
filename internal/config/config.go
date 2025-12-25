@@ -14,6 +14,7 @@ type Config struct {
 	Retention  RetentionConfig  `yaml:"retention"`
 	Encryption EncryptionConfig `yaml:"encryption"`
 	Telegram   TelegramConfig   `yaml:"telegram"`
+	GitLab     GitLabConfig     `yaml:"gitlab"`
 	LockFile   string           `yaml:"lock_file"`
 }
 
@@ -44,6 +45,10 @@ type EncryptionConfig struct {
 type TelegramConfig struct {
 	BotToken string `yaml:"bot_token"`
 	ChatID   string `yaml:"chat_id"`
+}
+
+type GitLabConfig struct {
+	ContainerName string `yaml:"container_name"`
 }
 
 // LoadConfig loads the configuration from a YAML file.
