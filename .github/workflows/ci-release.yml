@@ -87,7 +87,7 @@ jobs:
           # 如想短 SHA：GIT_SHA="${GITHUB_SHA::7}"
           DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"       # UTC 时间
 
-          mkdir -p dist
+          mkdir -p output
 
           EXT=""
           if [ "${GOOS}" = "windows" ]; then
@@ -113,19 +113,17 @@ jobs:
 
           go build -trimpath \
             -ldflags "${LDFLAGS}" \
-            -o "dist/${BIN_NAME}-${GOOS}-${GOARCH}${EXT}" \
+            -o "output/${BIN_NAME}-${GOOS}-${GOARCH}${EXT}" \
             ./cmd/backup
 
           # ====== 下面按你现有逻辑打包即可（示例保留） ======
           ASSET_BASE="${BIN_NAME}-${TAG}-${GOOS}-${GOARCH}"
           if [ "${GOOS}" = "windows" ]; then
-            zip -j "dist/${ASSET_BASE}.zip" "dist/${BIN_NAME}-${GOOS}-${GOARCH}${EXT}" README* LICENSE* 2>/dev/null || \
-              zip -j "dist/${ASSET_BASE}.zip" "dist/${BIN_NAME}-${GOOS}-${GOARCH}${EXT}"
-            echo "ASSET_PATH=dist/${ASSET_BASE}.zip" >> $GITHUB_ENV
+            zip -j "output/${ASSET_BASE}.zip" "output/${BIN_NAME}-${GOOS}-${GOARCH}${EXT}"
+            echo "ASSET_PATH=output/${ASSET_BASE}.zip" >> $GITHUB_ENV
           else
-            tar -czf "dist/${ASSET_BASE}.tar.gz" -C dist "${BIN_NAME}-${GOOS}-${GOARCH}${EXT}" \
-              $(ls README* LICENSE* 2>/dev/null || true)
-            echo "ASSET_PATH=dist/${ASSET_BASE}.tar.gz" >> $GITHUB_ENV
+            tar -czf "output/${ASSET_BASE}.tar.gz" -C output "${BIN_NAME}-${GOOS}-${GOARCH}${EXT}"
+            echo "ASSET_PATH=output/${ASSET_BASE}.tar.gz" >> $GITHUB_ENV
           fi
 
       - name: Create GitHub Release and upload asset

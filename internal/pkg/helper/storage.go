@@ -1,4 +1,4 @@
-package storage
+package helper
 
 import (
 	"context"
@@ -8,9 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/davexpro/backup/internal/config"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+
+	"github.com/davexpro/backup/internal/config"
 )
 
 type Storage struct {
@@ -52,14 +53,6 @@ func (s *Storage) Upload(ctx context.Context, filename string, content io.Reader
 	if s.pathPrefix == "" {
 		key = filename
 	}
-
-	// MinIO PutObject requires size or -1 if unknown (but with high memory usage if unknown)
-	// For Gzip stream, we might not know size unless we pass it.
-	// However, we usually operate on a temp file in this app, so we can know size.
-	// But the interface receives io.Reader. In manager.go we use os.Open.
-	// We'll trust PutObject to handle it or we should update interface or let MinIO SDK handle loose size (-1).
-	// Using -1 for size tells MinIO client to determine size (read until EOF) which stores in RAM if smaller than part size?
-	// The MinIO SDK v7 handles -1 by using multipart upload automatically.
 
 	info, err := s.client.PutObject(ctx, s.bucket, key, content, -1, minio.PutObjectOptions{
 		ContentType: "application/gzip",
