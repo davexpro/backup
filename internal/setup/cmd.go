@@ -19,5 +19,5 @@ func run(ctx context.Context, c *cli.Command) error {
 		return fmt.Errorf("the setup command is only supported on Debian-based systems")
 	}
 
-	return checkAndInstallMySQLShell()
+	return checkAndInstallForDebian()
 }

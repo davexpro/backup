@@ -18,14 +18,19 @@ var Command = &cli.Command{
 }
 
 func run(ctx context.Context, c *cli.Command) error {
-	// 1. Load config
+	// 1. Check required tools
+	if err := helper.CheckTools("docker", "zip", "unzip"); err != nil {
+		return err
+	}
+
+	// 2. Load config
 	configPath := c.String("config")
 	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// 2. File locking
+	// 3. File locking
 	unlock, err := helper.AcquireLock(cfg.LockFile)
 	if err != nil {
 		return fmt.Errorf("could not acquire lock: %w", err)

@@ -14,7 +14,7 @@ import (
 	"github.com/davexpro/backup/internal/pkg/helper"
 )
 
-// Worker handles MySQL backup operations.
+// Worker handles MySQL backup and recovery operations.
 type Worker struct {
 	cfg      *config.Config
 	store    *helper.Storage
@@ -22,7 +22,7 @@ type Worker struct {
 	onlyDump bool
 }
 
-// NewWorker creates a new MySQL backup worker.
+// NewWorker creates a new MySQL worker.
 func NewWorker(cfg *config.Config, store *helper.Storage, notifier *helper.TelegramSender, onlyDump bool) *Worker {
 	return &Worker{
 		cfg:      cfg,
@@ -32,8 +32,8 @@ func NewWorker(cfg *config.Config, store *helper.Storage, notifier *helper.Teleg
 	}
 }
 
-// Run executes the MySQL backup workflow.
-func (w *Worker) Run(ctx context.Context) error {
+// Backup executes the MySQL backup workflow.
+func (w *Worker) Backup(ctx context.Context) error {
 	// List databases using mysqlsh
 	databases, err := w.listDatabases(ctx)
 	if err != nil {
@@ -47,6 +47,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	var results []helper.BackupResult
 	var successCount, failCount int
 
+	timeNow := time.Now()
 	for _, dbName := range databases {
 		if w.shouldExcludeDB(dbName) {
 			log.Printf("Skipping excluded database: %s", dbName)
@@ -55,7 +56,7 @@ func (w *Worker) Run(ctx context.Context) error {
 
 		log.Printf("Backing up database: %s", dbName)
 		start := time.Now()
-		result := w.backupDatabase(ctx, dbName)
+		result := w.backupDatabase(ctx, dbName, timeNow)
 		result.Duration = time.Since(start)
 
 		if result.Success {
@@ -78,6 +79,89 @@ func (w *Worker) Run(ctx context.Context) error {
 	if failCount > 0 {
 		return fmt.Errorf("backup completed with %d failures", failCount)
 	}
+	return nil
+}
+
+// Recover restores data from a dump path (directory or zip).
+func (w *Worker) Recover(ctx context.Context, inputPath string) error {
+	log.Printf("Starting recovery from: %s", inputPath)
+
+	info, err := os.Stat(inputPath)
+	if err != nil {
+		return fmt.Errorf("failed to access input path: %w", err)
+	}
+
+	dumpDir := inputPath
+	isZip := !info.IsDir() && strings.HasSuffix(strings.ToLower(inputPath), ".zip")
+
+	if isZip {
+		log.Printf("Detecting zip file, extracting to temporary directory...")
+		tempRestoreDir := filepath.Join(w.cfg.Backup.TempDir, fmt.Sprintf("restore_%d", time.Now().Unix()))
+		if err := os.MkdirAll(tempRestoreDir, 0755); err != nil {
+			return fmt.Errorf("failed to create temp restore dir: %w", err)
+		}
+		defer os.RemoveAll(tempRestoreDir)
+
+		// Unzip logic (using system unzip or our helper if we add it)
+		// For now using shell unzip as it's common and supports pwd
+		unzipArgs := []string{"-o", inputPath, "-d", tempRestoreDir}
+		if w.cfg.Encryption.Password != "" {
+			unzipArgs = append([]string{"-P", w.cfg.Encryption.Password}, unzipArgs...)
+		}
+
+		log.Printf("Executing unzip %v", unzipArgs)
+		unzipCmd := exec.CommandContext(ctx, "unzip", unzipArgs...)
+		if output, err := unzipCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("unzip failed: %w, output: %s", err, string(output))
+		}
+
+		// The zip might contain a subfolder (like dbname_timestamp) or direct files
+		// mysqlsh util.loadDump needs the directory containing the @.json metadata
+		dumpDir = tempRestoreDir
+
+		// Look for subfolders if the root of unzip doesn't have @.json
+		if _, err := os.Stat(filepath.Join(dumpDir, "@.json")); os.IsNotExist(err) {
+			entries, _ := os.ReadDir(dumpDir)
+			for _, entry := range entries {
+				if entry.IsDir() {
+					subDir := filepath.Join(dumpDir, entry.Name())
+					if _, err := os.Stat(filepath.Join(subDir, "@.json")); err == nil {
+						dumpDir = subDir
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if _, err := os.Stat(filepath.Join(dumpDir, "@.json")); os.IsNotExist(err) {
+		return fmt.Errorf("dump metadata (@.json) not found in %s", dumpDir)
+	}
+
+	log.Printf("Restoring from directory: %s", dumpDir)
+
+	// util.loadDump(path, {threads: N, ignoreVersion: true, ...})
+	loadOpts := fmt.Sprintf("{threads: %d, ignoreVersion: true}", w.cfg.MySQL.Threads)
+	script := fmt.Sprintf("util.loadDump('%s', %s)", dumpDir, loadOpts)
+
+	args := []string{
+		fmt.Sprintf("--user=%s", w.cfg.MySQL.User),
+		fmt.Sprintf("--password=%s", w.cfg.MySQL.Password),
+		fmt.Sprintf("--host=%s", w.cfg.MySQL.Host),
+		fmt.Sprintf("--port=%d", w.cfg.MySQL.Port),
+		"--js",
+		"-e",
+		script,
+	}
+
+	log.Printf("Executing mysqlsh recovery script...")
+	cmd := exec.CommandContext(ctx, "mysqlsh", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("mysqlsh recovery failed: %w, output: %s", err, string(output))
+	}
+
+	log.Printf("Recovery completed successfully:\n%s", string(output))
 	return nil
 }
 
@@ -121,7 +205,6 @@ func (w *Worker) listDatabases(ctx context.Context) ([]string, error) {
 
 // filterDatabases filters databases based on include list
 func (w *Worker) filterDatabases(databases []string) []string {
-	// If include list is specified, only include those databases
 	var filtered []string
 	for _, dbName := range databases {
 		if strings.Contains(dbName, "WARNING:") {
@@ -130,14 +213,16 @@ func (w *Worker) filterDatabases(databases []string) []string {
 		filtered = append(filtered, dbName)
 	}
 	if len(w.cfg.MySQL.Include) > 0 {
+		var includedOnly []string
 		for _, db := range filtered {
 			for _, inc := range w.cfg.MySQL.Include {
 				if db == inc {
-					filtered = append(filtered, db)
+					includedOnly = append(includedOnly, db)
 					break
 				}
 			}
 		}
+		return includedOnly
 	}
 	return filtered
 }
@@ -158,8 +243,8 @@ func (w *Worker) shouldExcludeDB(dbName string) bool {
 	return false
 }
 
-func (w *Worker) backupDatabase(ctx context.Context, dbName string) helper.BackupResult {
-	timestamp := time.Now().Format("20060102_150405")
+func (w *Worker) backupDatabase(ctx context.Context, dbName string, timeNow time.Time) helper.BackupResult {
+	timestamp := timeNow.Format("20060102_150405")
 	dumpDir := filepath.Join(w.cfg.Backup.TempDir, fmt.Sprintf("%s_%s", dbName, timestamp))
 
 	zipFilename := fmt.Sprintf("%s_%s.zip", dbName, timestamp)
